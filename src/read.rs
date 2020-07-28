@@ -1,142 +1,236 @@
-//! Deserialization code.
+//! Reading Lua Binary Chunks from IO sources.
 
-use std::error::Error;
-use std::io::{self, Read};
-use std::mem::size_of;
-use byteorder::ReadBytesExt;
-use byteorder::NativeEndian as E;
-
-use super::{
-    SIGNATURE, FORMAT, VERSION, DATA, TEST_INT, TEST_NUMBER,
-    Int, Size, Instruction, Integer, Number,
-    Constant, Upvalue, LocalVar, Debug, Function,
+use crate::types::{
+    Chunk,
+    ChunkHeader,
+    LuaEndianness,
+    LuaInteger,
+    LuaNumber,
+    ValueSize,
+    Version,
 };
 
-/// Deserialize bytecode into a `Function`.
-pub fn read_file<R: Read>(read: R) -> io::Result<Function> {
-    let mut reader = Reader { out: read };
-    reader.read_header()?;
-    reader.out.read_u8()?; // discard upvals header
-    reader.read_function()
+use std::io::{self, Read};
+
+use byteorder::{BE, LE, ByteOrder, ReadBytesExt};
+
+
+// common binary chunk signature
+const LUA_SIGNATURE: &'static [u8] = b"\x1bLua";
+// used by lua 5.3
+const DATA: &'static [u8] = b"\x19\x93\r\n\x1a\n";
+// A test integer to know endianness.
+const TEST_INT: i64 = 0x5678;
+// A test floating-point number to know endianness.
+const TEST_NUMBER: f64 = 370.5;
+
+fn field_error(e: io::Error, name: &str) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!("Unable to read field \"{}\": {}", name, e),
+    )
 }
 
-struct Reader<R: Read> {
-    out: R,
+pub fn read_chunk<R: Read>(mut r: R) -> io::Result<Chunk> {
+    let header = read_header(&mut r)?;
+    todo!()
 }
 
-fn invalid<T, S: Into<Box<dyn Error + Send + Sync>>>(s: S) -> io::Result<T> {
-    Err(io::Error::new(io::ErrorKind::InvalidInput, s))
-}
+fn read_header<R: Read>(mut r: R) -> io::Result<ChunkHeader> {
+    let mut buf = [0u8; 8];
 
-macro_rules! check {
-    ($get:expr, $want:expr, $note:expr) => {{
-        let get = $get;
-        let want = $want;
-        if get != want {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!(
-                "invalid {}, expected {:?} but got {:?}",
-                $note, want, get,
-            )));
-        }
-    }}
-}
-
-impl<R: Read> Reader<R> {
-    fn read_all(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        let mut start = 0;
-        let len = buf.len();
-        while start < len {
-            let n = self.out.read(&mut buf[start..])?;
-            if n == 0 {
-                return invalid("unexpected EOF");
-            }
-            start += n;
-        }
-        Ok(())
+    // Check for LuaJit first, even though unsupported atm.
+    r.read_exact(&mut buf[0..3]).map_err(|e| field_error(e, "signature"))?;
+    if &buf[..3] == &b"\x01LJ"[..] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LuaJit chunk detected, but this library does not support LuaJit",
+        ));
     }
 
-    fn read_header(&mut self) -> io::Result<()> {
-        let mut buffer = [0u8; 6];
-        self.read_all(&mut buffer[..4])?;
-        check!(&buffer[..4], SIGNATURE, "signature");
-        check!(self.out.read_u8()?, VERSION, "version");
-        check!(self.out.read_u8()?, FORMAT, "format");
-        self.read_all(&mut buffer)?;
-        check!(&buffer, DATA, "test data");
-        check!(self.out.read_u8()?, size_of::<Int>() as u8, "sizeof(int)");
-        check!(self.out.read_u8()?, size_of::<Size>() as u8, "sizeof(size_t)");
-        check!(self.out.read_u8()?, size_of::<Instruction>() as u8, "sizeof(Instruction)");
-        check!(self.out.read_u8()?, size_of::<Integer>() as u8, "sizeof(Integer)");
-        check!(self.out.read_u8()?, size_of::<Number>() as u8, "sizeof(Number)");
-        check!(self.out.read_f64::<E>()?, TEST_NUMBER, "test number");
-        check!(self.out.read_i64::<E>()?, TEST_INT, "test integer");
-        Ok(())
+    // Regular Lua 5x signature
+    r.read_exact(&mut buf[3..4]).map_err(|e| field_error(e, "signature"))?;
+    if &buf[..4] != LUA_SIGNATURE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unrecognized Lua signature {:x?}", &buf[..3]),
+        ));
     }
 
-    fn read_function(&mut self) -> io::Result<Function> {
-        Ok(Function {
-            source: self.read_string()?,
-            line_start: self.out.read_i32::<E>()?,
-            line_end: self.out.read_i32::<E>()?,
-            num_params: self.out.read_u8()?,
-            is_vararg: self.out.read_u8()? != 0,
-            max_stack_size: self.out.read_u8()?,
-            code: self.read_vec(|this| Ok(this.out.read_u32::<E>()?))?,
-            constants: self.read_vec(|this| Ok(match this.out.read_u8()? {
-                0x00 => Constant::Nil,
-                0x01 => Constant::Boolean(this.out.read_u8()? != 0),
-                0x03 => Constant::Float(this.out.read_f64::<E>()?),
-                0x13 => Constant::Int(this.out.read_i64::<E>()?),
-                0x04 => Constant::ShortString(this.read_string()?),
-                0x14 => Constant::LongString(this.read_string()?),
-                o => return invalid(format!("unknown constant type {}", o)),
-            }))?,
-            upvalues: self.read_vec(|this| {
-                let stack = this.out.read_u8()?;
-                let idx = this.out.read_u8()?;
-                Ok(match stack {
-                    0 => Upvalue::Outer(idx),
-                    _ => Upvalue::Stack(idx),
-                })
-            })?,
-            protos: self.read_vec(|this| this.read_function())?,
-            debug: Debug {
-                lineinfo: self.read_vec(|this| Ok(this.out.read_i32::<E>()?))?,
-                localvars: self.read_vec(|this| Ok(LocalVar {
-                    name: this.read_string()?,
-                    start_pc: this.out.read_i32::<E>()?,
-                    end_pc: this.out.read_i32::<E>()?,
-                }))?,
-                upvalues: self.read_vec(|this| this.read_string())?,
+    // Read and map version
+    let version = r.read_u8().map_err(|e| field_error(e, "version"))?;
+    let version = match version {
+        0x51 => Version::Lua51,
+        0x53 => Version::Lua53,
+        _ => return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported version {:x}", version),
+        )),
+    };
+
+    let format = r.read_u8().map_err(|e| field_error(e, "format"))?;
+    if format != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported format {:x}", format),
+        ));
+    }
+
+    if version == Version::Lua53 {
+        r.read_exact(&mut buf[..6]).map_err(|e| field_error(e, "test_data"))?;
+        if &buf[..6] != &DATA[..] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unrecognized lua 5.3 test data: {:x?}", &buf[..6]),
+            ));
+        }
+    }
+
+    let mut endianness: LuaEndianness = LuaEndianness::Big;
+
+    if version == Version::Lua51 {
+        let e = r.read_u8().map_err(|e| field_error(e, "endianness"))?;
+        match e {
+            0 => endianness = LuaEndianness::Big,
+            1 => endianness = LuaEndianness::Little,
+            _ => return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported endianness {:x}", e),
+            )),
+        }
+    }
+
+    let int_bytes = match r.read_u8().map_err(|e| field_error(e, "int_bytes"))? {
+        4 => ValueSize::Four,
+        8 => ValueSize::Eight,
+        v => return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported int_bytes value size {}", v),
+        )),
+    };
+    dbg!(int_bytes);
+    let size_t_bytes = match r.read_u8().map_err(|e| field_error(e, "size_t_bytes"))? {
+        4 => ValueSize::Four,
+        8 => ValueSize::Eight,
+        v => return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported size_t_bytes value size {}", v),
+        )),
+    };
+    dbg!(size_t_bytes);
+    let inst_bytes = match r.read_u8().map_err(|e| field_error(e, "inst_bytes"))? {
+        4 => ValueSize::Four,
+        8 => ValueSize::Eight,
+        v => return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported inst_bytes value size {}", v),
+        )),
+    };
+    dbg!(int_bytes);
+    let mut integer_bytes = ValueSize::Eight;
+    if version != Version::Lua51 {
+        integer_bytes = match r.read_u8().map_err(|e| field_error(e, "integer_bytes"))? {
+            4 => ValueSize::Four,
+            8 => ValueSize::Eight,
+            v => return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported integer_bytes value size {}", v),
+            )),
+        };
+    }
+    dbg!(integer_bytes);
+    let num_bytes = match r.read_u8().map_err(|e| field_error(e, "num_bytes"))? {
+        4 => ValueSize::Four,
+        8 => ValueSize::Eight,
+        v => return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported num_bytes value size {}", v),
+        )),
+    };
+    dbg!(num_bytes);
+
+    // 52/53 endianness detection
+    if version == Version::Lua53 {
+        // why did puc-rio switch to this? so annoying...
+        let mut endian = LuaEndianness::Big;
+        let mut test_int = match integer_bytes {
+            ValueSize::Four => {
+                r.read_i32::<BE>().map(|v| v as i64)
             },
-        })
-    }
+            ValueSize::Eight => {
+                r.read_i64::<BE>()
+            },
+        }.map_err(|e| field_error(e, "test_int"))?;
+        let mut test_num = match num_bytes {
+            ValueSize::Four => {
+                r.read_f32::<BE>().map(|v| v as f64)
+            },
+            ValueSize::Eight => {
+                r.read_f64::<BE>()
+            },
+        }.map_err(|e| field_error(e, "test_num"))?;
 
-    #[inline]
-    fn read_vec<F, T>(&mut self, f: F) -> io::Result<Vec<T>>
-    where F: Fn(&mut Self) -> io::Result<T>
-    {
-        let len = self.out.read_u32::<E>()?;
-        (0..len).map(|_| f(self)).collect()
-    }
+        if test_int != TEST_INT {
+            test_int = test_int.to_le();
+            test_num = f64::from_le_bytes(test_num.to_le_bytes());
+            endian = LuaEndianness::Little;
 
-    fn read_string(&mut self) -> io::Result<String> {
-        let first = self.out.read_u8()?;
-        if first == 0 {
-            Ok(String::new())
-        } else {
-            let len = if first < 0xff {
-                first as usize
-            } else {
-                self.out.read_u32::<E>()? as usize
-            } - 1;
-            let mut buffer = vec![0u8; len];
-            self.read_all(&mut buffer)?;
-            // TODO: May need to return a Vec<u8> rather than String
-            match String::from_utf8(buffer) {
-                Ok(s) => Ok(s),
-                Err(_) => invalid("not utf8"),
+            if test_num != TEST_NUMBER {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Unrecognized test integer",
+                ));
             }
         }
+
+        if test_num.abs() - TEST_NUMBER > 0.0001 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unrecognized test number",
+            ));
+        }
+
+        endianness = endian;
+    }
+    let integral_flag;
+    if version == Version::Lua51 {
+        integral_flag = r.read_u8().map_err(|e| field_error(e, "integral_flag"))? == 1;
+    } else {
+        integral_flag = false;
+    }
+
+    Ok(ChunkHeader {
+        version,
+        endian: endianness,
+        int_bytes,
+        size_bytes: size_t_bytes,
+        inst_bytes,
+        lua_integer_bytes: integer_bytes,
+        lua_number_bytes: num_bytes,
+        integral_flag,
+    })
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use std::io::Cursor;
+
+    static LUAC51_BYTES: &'static [u8] = include_bytes!("test/test51le.luac");
+
+    #[test]
+    fn test_header_51() {
+        let header = read_header(Cursor::new(LUAC51_BYTES)).unwrap();
+        assert_eq!(header, ChunkHeader {
+            version: Version::Lua51,
+            endian: LuaEndianness::Little,
+            int_bytes: ValueSize::Four,
+            size_bytes: ValueSize::Four,
+            inst_bytes: ValueSize::Four,
+            lua_integer_bytes: ValueSize::Eight,
+            lua_number_bytes: ValueSize::Eight,
+            integral_flag: false,
+        });
     }
 }

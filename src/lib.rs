@@ -5,11 +5,12 @@
 use std::os::raw::c_int;
 
 pub mod bytecode;
-mod write;
+// mod write;
 mod read;
+pub mod types;
 
-pub use write::write_file;
-pub use read::read_file;
+// pub use self::write::write_chunk;
+pub use self::read::read_chunk;
 
 /// Signature to mark Lua bytecode files.
 pub const SIGNATURE: &'static [u8] = b"\x1bLua";
