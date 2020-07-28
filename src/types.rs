@@ -1,7 +1,5 @@
 //! Types for various concepts in Lua chunks.
 
-use std::ffi::CString;
-
 /// The `nil` type in Lua.
 pub type LuaNil = ();
 
@@ -15,7 +13,7 @@ pub type LuaNumber = f64;
 pub type LuaInteger = i64;
 
 /// An instruction in a Lua binary chunk.
-pub type LuaInstruction = i64;
+pub type LuaInstruction = u64;
 
 /// An entry in the constant pool.
 ///
@@ -44,7 +42,7 @@ pub enum Constant {
     /// the conventions used in C. This means that there is a difference between
     /// an empty string (1 NUL byte) versus a string which does not exist at all
     /// (0 bytes) when encoded in a Lua binary chunk.
-    String(CString),
+    String(Vec<u8>),
 }
 
 /// An entry in the upvalue list of a binary chunk.
@@ -58,26 +56,26 @@ pub enum Upvalue {
 
 /// An entry in the local variable debug table of a binary chunk.
 #[derive(Clone, Debug, PartialEq)]
-pub struct LocalVar {
+pub struct LuaDebugLocalVar {
     /// The local variable's name.
-    pub name: Option<CString>,
+    pub name: Vec<u8>,
     /// The instruction at which the local variable is introduced.
-    pub start_pc: LuaInteger,
+    pub start_pc: i64,
     /// The instruction at which the local variable goes out of scope.
-    pub end_pc: LuaInteger,
+    pub end_pc: i64,
 }
 
 /// Optional debugging information for a function.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Debug {
+pub struct LuaDebug {
     /// The line number of each bytecode instruction.
-    pub lineinfo: Vec<LuaInteger>,
+    pub lineinfo: Vec<i64>,
 
     /// The names and scopes of local variables.
-    pub localvars: Vec<LocalVar>,
+    pub localvars: Vec<LuaDebugLocalVar>,
 
     /// The names of upvalues.
-    pub upvalues: Vec<CString>,
+    pub upvalues: Vec<Vec<u8>>,
 }
 
 /// A Lua function prototype.
@@ -88,19 +86,19 @@ pub struct Debug {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prototype {
     /// The source filename of the function. May be empty.
-    pub source: Option<CString>,
+    pub source: Vec<u8>,
 
     /// The start line number of the function.
-    pub line_start: LuaInteger,
+    pub line_defined: i64,
 
     /// The end line number of the function.
-    pub line_end: LuaInteger,
+    pub last_line_defined: i64,
 
     /// The number of fixed parameters the function takes.
     pub num_params: u8,
 
     /// Whether the function accepts a variable number of arguments.
-    pub is_vararg: bool,
+    pub is_vararg: u8,
 
     /// The number of registers needed by the function.
     pub max_stack_size: u8,
@@ -114,11 +112,15 @@ pub struct Prototype {
     /// The upvalue information of the function.
     pub upvalues: Vec<Upvalue>,
 
+    /// The number of upvalues for Lua 5.1. If you are converting from Lua 5.1
+    /// to Lua 5.3, you will need to create explicit upvalues yourself.
+    pub nups: u8,
+
     /// The function's contained function prototypes.
     pub protos: Vec<Prototype>,
 
     /// Debugging information for the function.
-    pub debug: Option<Debug>,
+    pub debug: LuaDebug,
 }
 
 #[derive(Clone, Debug, PartialEq)]
